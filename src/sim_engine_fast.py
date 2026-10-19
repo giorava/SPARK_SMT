@@ -697,6 +697,16 @@ def run_full_simulation(
     # -----------------------------------------------------------------
     site_rng=None, mol_rng=None,
     precomputed_sites=None,
+    # -----------------------------------------------------------------
+    # Binding / single-molecule tracking hook (see smt_tracking.py).
+    # Optional object with .start(**info) and .observe(step, pos, states,
+    # sites, bound_site_indices, unbind_times). It is called at the same
+    # pre-step snapshot point the exposure buffers use, so step k in the
+    # tracker is exactly exposure sub-step k in the images. The tracker
+    # only READS state and never touches an RNG, so passing one does not
+    # change the simulation outcome for a given seed.
+    # -----------------------------------------------------------------
+    tracker=None,
 ):
     
     # === REPRODUCIBILITY: seed numpy's global RNG before anything random ===
@@ -729,7 +739,9 @@ def run_full_simulation(
     steps_per_display = int(display_dt_s / sim_dt_s)
     if steps_per_display < 1:
         steps_per_display = 1
-    steps_per_exposure = max(1, int(exposure_time_s / sim_dt_s))
+
+    # over how many time steps the position of the particle needs to be averaged
+    steps_per_exposure = max(1, int(exposure_time_s / sim_dt_s))  
 
     vol_um3 = (4.0 / 3) * np.pi * (radius_um ** 3)
     num_molecules = int(((tf_concentration_nM * 1e-9) * (vol_um3 * 1e-15)) * 6.022e23)
@@ -794,10 +806,12 @@ def run_full_simulation(
     site_cluster_idx = np.array([cluster_id_to_idx[cid] for cid in cluster_ids])
     cluster_occupancy_count = np.zeros(num_clusters, dtype=int)
 
+    # random positioning of the molecules within the radius
     pos = _mol_rng.normal(size=(num_molecules, 3))
     pos /= np.linalg.norm(pos, axis=1)[:, np.newaxis]
     pos *= (_mol_rng.random(num_molecules) ** (1.0 / 3) * radius_um)[:, np.newaxis]
 
+    # definition of the molecular states for the tfs [(diffusing, bound) or (diffusing, intermediate, bound)]
     if two_state_mode:
         total_pct = pct_free_init + pct_ns_init
         if total_pct == 0:
@@ -831,6 +845,7 @@ def run_full_simulation(
     p_ns_out = (1.0 / ns_res_time) * sim_dt_s if ns_res_time > 0 else 1.0
 
     def sample_ds(state_arr):
+        "Seetting different diffusion coeficients for different molecules types"
         ds = np.zeros_like(state_arr, dtype=float)
         m0 = (state_arr == 0)
         ds[m0] = np.maximum(0, _mol_rng.normal(d_free, d_free_std,
@@ -868,6 +883,17 @@ def run_full_simulation(
     sites_are_static = (bs_diff_mean <= 0 and bs_diff_std <= 0
                         and bs_jiggle_std <= 0)
     cached_tree = cKDTree(sites) if sites_are_static else None
+
+    if tracker is not None:
+        tracker.start(
+            num_molecules=num_molecules,
+            is_synthetic=np.asarray(is_synthetic, dtype=bool),
+            site_strengths=np.asarray(site_strengths, dtype=float),
+            sim_dt_s=sim_dt_s,
+            steps_per_display=steps_per_display,
+            steps_per_exposure=steps_per_exposure,
+            num_display_frames=num_display_frames,
+        )
 
     for display_frame in range(num_display_frames):
         # Generate fBm steps for this frame only
@@ -925,6 +951,10 @@ def run_full_simulation(
                     'sites': sites.copy(),
                     'occupancy': (site_occupancy >= 0).copy()})
 
+            if tracker is not None:
+                tracker.observe(physics_step, pos, states, sites,
+                                bound_site_indices, unbind_times)
+
             # Binding check policy: always check inside the exposure
             # window (matches the old exposure-loop behavior); honor
             # binding_check_interval outside it (matches the old
@@ -972,6 +1002,11 @@ def run_full_simulation(
 
         if progress_callback:
             progress_callback(display_frame + 1, num_display_frames)
+
+    # Final observation captures any binding change during the last step.
+    if tracker is not None:
+        tracker.observe(physics_step, pos, states, sites,
+                        bound_site_indices, unbind_times)
 
     return exposure_data, num_molecules, site_strengths, is_synthetic, \
         steps_per_exposure, step_history

@@ -70,6 +70,7 @@ from sim_engine_fast import (
     build_site_layout,
 )
 import sim_repro                       # <-- ADD THIS LINE
+import smt_tracking
 
 # ============================================================================
 # SINGLE-ROW WORKER
@@ -95,6 +96,24 @@ def process_single_row(args_tuple):
 
     row = pd.Series(row_dict)
     p = extract_batch_row_params(row)
+
+    # ---- Binding tracking / SMT settings --------------------------------
+    # Decide whether this row should record binding events at all.
+    # Tracking is needed if the user passed --record-binding (tables only)
+    # or --smt (tables + single-molecule images). --smt implies tracking,
+    # so either flag switches it on
+
+    # Look for a per-row label choice in the CSV column "smt_label"
+    # (e.g. "synthetic:1", "random:N", "ids:4", "ids:4,17"). random:N indicates to choose random N 
+    # molecules for SMT and then follow them, i.e. random:1 indicates label 1 moelcule randomly
+    # and follow. Synthethic:1 means label a molecule that is binding surely. The picked molecule 
+    # can also be specified via the ids. 
+    want_tracking = bool(config.get('record_binding') or config.get('smt'))
+    _row_spec = row.get('smt_label', None)
+    row_label_spec = (str(_row_spec).strip()
+                      if isinstance(_row_spec, str) and _row_spec.strip()
+                      else config.get('smt_label', 'random:1'))
+    tracking_result = None
 
     # === REPRODUCIBILITY / GROUND-TRUTH CACHING ===========================
     # If this row opts in via a sim_group column, check whether another row
@@ -137,6 +156,12 @@ def process_single_row(args_tuple):
         site_strengths = cached_payload['site_strengths']
         is_synthetic = cached_payload['is_synthetic']
         n_mol = cached_payload['num_molecules']
+        tracking_result = cached_payload.get('tracking')
+        if want_tracking and tracking_result is None:
+            _log("[Row %d] WARNING: sim_group=%s cache was written without "
+                 "binding tracking, so no tracking/SMT output for this row. "
+                 "Delete %s/_sim_cache/ and re-run with --record-binding or "
+                 "--smt." % (row_idx, sim_group, config['outdir']))
 
         if sim_repro.needs_rebin(row, cached_payload):
             # Level 2: row's display_dt / exposure_time_ms / num_frames
@@ -246,6 +271,16 @@ def process_single_row(args_tuple):
             if seed_base is not None:
                 np.random.seed(seed_base + row_idx)
 
+        # ---- Binding / SMT tracker (read-only; does not consume RNG) ----
+        tracker = None
+        label_seed = (row_sim_seed if row_sim_seed is not None else
+                      (seed_base + row_idx if seed_base is not None else None))
+        if want_tracking:
+            tracker = smt_tracking.BindingTracker(
+                label_spec=row_label_spec,
+                trajectory_stride=config.get('trajectory_stride', 0),
+                label_seed=label_seed)
+
         exposure_data, n_mol, site_strengths, is_synthetic, spe, step_history = run_full_simulation(
             int(row['num_frames']), int(row['num_binding_sites']),
             float(row['nucleus_diameter_nm']), float(row['tf_concentration_nM']),
@@ -276,7 +311,9 @@ def process_single_row(args_tuple):
             site_rng=sim_site_rng, mol_rng=sim_mol_rng,
             record_step_history=use_repro,
             precomputed_sites=precomputed_sites,
+            tracker=tracker,
         )
+        tracking_result = tracker.result() if tracker is not None else None
 
         _log("[Row %d] Simulation complete: %d molecules" % (row_idx, n_mol))
 
@@ -297,6 +334,7 @@ def process_single_row(args_tuple):
                 'steps_per_exposure': spe,
                 'physics_hash': row_phys_hash,
                 'sim_seed': row_sim_seed,
+                'tracking': tracking_result,
                 # --- Level 2 additions ---
                 'step_history': step_history,
                 'timing_meta': {
@@ -333,6 +371,24 @@ def process_single_row(args_tuple):
 
     display_frames = sorted(exposure_mol_data.keys())
     _log("[Row %d] Exposure frames computed: %d display frames" % (row_idx, len(display_frames)))
+
+    # ---- Binding tables, labelled tracks, SMT images --------------------
+    if want_tracking and tracking_result is not None:
+        _spd = max(1, int(float(row['display_dt']) / float(row['sim_dt'])))
+        _geom = smt_tracking.image_geometry(
+            float(row['nucleus_diameter_nm']), float(row['voxel_size_nm']),
+            float(row['slice_spacing_nm']), p.get('num_slices'))
+        _lseed = (row_sim_seed if row_sim_seed is not None else
+                  (seed_base + row_idx if seed_base is not None else None))
+        smt_tracking.write_tracking_outputs(
+            row_outdir, tracking_result, exposure_data, row_label_spec,
+            smt_tracking.make_label_rng(_lseed), _geom,
+            num_frames=int(row['num_frames']), spd=_spd, spe=int(spe),
+            lateral_fwhm_nm=p['lateral_fwhm'], axial_fwhm_nm=p['axial_fwhm'],
+            near_radius_nm=config.get('near_radius_nm', 250.0),
+            write_smt=bool(config.get('smt')),
+            smt_params=config.get('smt_params'),
+            log=lambda m: _log("[Row %d]%s" % (row_idx, m)))
 
     # Compute grids and track max intensity
     row_grids = {}
@@ -653,8 +709,14 @@ def _build_hyperstacks(row_idx, row_outdir):
 
             out_name = '%s_Hyperstack.tif' % subdir
             out_path = os.path.join(row_outdir, out_name)
-            tiff_imwrite(out_path, out_arr, imagej=True,
-                         metadata={'axes': axes})
+            _meta = {'axes': axes}
+            if out_arr.dtype == np.uint16 and axes == 'TZYX':
+                # 16-bit data rarely spans 0-65535; without a stored display
+                # range most viewers show it as black. Data is unchanged.
+                _lo = float(np.percentile(out_arr, 0.5))
+                _hi = float(out_arr.max())
+                _meta.update(min=_lo, max=_hi if _hi > _lo else _lo + 1.0)
+            tiff_imwrite(out_path, out_arr, imagej=True, metadata=_meta)
             _log("[Row %d] Hyperstack: %s (%s, axes=%s)" % (
                 row_idx, out_name,
                 'x'.join(str(s) for s in out_arr.shape), axes))
@@ -777,6 +839,45 @@ def main():
                              'the CSV and SIDEBAR_DEFAULTS (which default to '
                              'enabled). Use this to render with vmax '
                              'normalization instead of absolute AU units.')
+    # ---- Binding tracking / single-molecule tracking (SMT) ----
+    g = parser.add_argument_group('binding tracking / single-molecule tracking')
+    g.add_argument('--record-binding', action='store_true',
+                   help='Record every binding / state change of every molecule '
+                        '(Tracking/ folder: state_events, site_dwells, '
+                        'synthetic_dwells, synthetic_visits, labelled tracks).')
+    g.add_argument('--smt', action='store_true',
+                   help='Also render SMT images (SMT_16bit/) showing ONLY the '
+                        'labelled molecule(s). Implies --record-binding.')
+    g.add_argument('--smt-label', default='random:1',
+                   help='Which molecules are labelled: "random:N", "ids:3,17" '
+                        'or "synthetic:N" (N molecules that bound the '
+                        'synthetic array). A per-row CSV column "smt_label" '
+                        'overrides this. Default: random:1')
+    g.add_argument('--smt-photons', type=float, default=300.0,
+                   help='Photons per labelled molecule per exposure, in focus '
+                        '(default 300)')
+    g.add_argument('--smt-background', type=float, default=10.0,
+                   help='Background photons per pixel per exposure (default 10)')
+    g.add_argument('--smt-gain', type=float, default=1.0,
+                   help='Camera gain, ADU per photoelectron (default 1)')
+    g.add_argument('--smt-offset', type=float, default=100.0,
+                   help='Camera baseline in ADU (default 100)')
+    g.add_argument('--smt-read-noise', type=float, default=1.5,
+                   help='Read noise, e- rms (default 1.5)')
+    g.add_argument('--smt-no-noise', action='store_true',
+                   help='Noise-free SMT images (expected values only)')
+    g.add_argument('--smt-focus', choices=['slices', 'synthetic'],
+                   default='slices',
+                   help='"slices" (default): SMT z-planes follow the row\'s '
+                        'slice settings. "synthetic": one focal plane at the '
+                        'depth of the synthetic array (at t = 0).')
+    g.add_argument('--near-radius-nm', type=float, default=250.0,
+                   help='Radius around synthetic sites for '
+                        'synthetic_neighborhood.csv (default 250 nm)')
+    g.add_argument('--trajectory-stride', type=int, default=0,
+                   help='Also save positions/states/bound site of ALL '
+                        'molecules every N physics steps (0 = off; large!)')
+
     args = parser.parse_args()
 
     if args.no_conv:
@@ -803,6 +904,17 @@ def main():
         'save_positions': args.save_positions,
         'positions_filename': args.positions_filename,
         'save_exposure': args.save_exposure,
+        'record_binding': args.record_binding or args.smt,
+        'smt': args.smt,
+        'smt_label': args.smt_label,
+        'smt_params': {'photons': args.smt_photons,
+                       'background': args.smt_background,
+                       'gain': args.smt_gain, 'offset': args.smt_offset,
+                       'read_noise': args.smt_read_noise,
+                       'add_noise': not args.smt_no_noise,
+                       'focus': args.smt_focus},
+        'near_radius_nm': args.near_radius_nm,
+        'trajectory_stride': args.trajectory_stride,
     }
 
     # ==================================================================
@@ -906,6 +1018,8 @@ def main():
     print("  Positions:  %s%s" % (args.save_positions,
                                   (" -> %s" % args.positions_filename) if args.save_positions else ""))
     print("  Exposure pkl: %s" % args.save_exposure)
+    print("  Tracking:   %s%s" % (config['record_binding'],
+          ("  (SMT images, default label=%s; CSV smt_label overrides)" % args.smt_label) if args.smt else ""))
     print("=" * 60)
 
     work_items = [(idx, batch_df.iloc[idx].to_dict(), config) for idx in row_indices]
